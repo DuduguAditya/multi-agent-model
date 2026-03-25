@@ -12,6 +12,7 @@ Usage:
     python main.py --mistral "your question"
 """
 
+import argparse
 import io
 import json
 import os
@@ -25,9 +26,9 @@ load_dotenv()
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 PROVIDERS = {
-    "--claude":  "anthropic/claude-sonnet-4-20250514",
-    "--gemini":  "gemini/gemini-2.0-flash",
-    "--mistral": "mistral/mistral-small-latest",
+    "claude":   "anthropic/claude-sonnet-4-20250514",
+    "gemini":   "gemini/gemini-2.0-flash",
+    "mistral":  "mistral/mistral-small-latest",
 }
 
 AVAILABLE_AGENTS = [
@@ -41,23 +42,12 @@ AVAILABLE_AGENTS = [
 MAX_RETRIES = 3
 
 
-def select_model():
-    for flag in PROVIDERS:
-        if flag in sys.argv:
-            sys.argv.remove(flag)
-            return PROVIDERS[flag]
-    return PROVIDERS["--claude"]
-
-
-MODEL = select_model()
-
-
 # ── Core LLM call ──────────────────────────────────────────────────────────────
 
-def call_llm(system_prompt, user_message):
+def call_llm(system_prompt, user_message, model):
     try:
         response = litellm.completion(
-            model=MODEL,
+            model=model,
             max_tokens=2048,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -84,7 +74,7 @@ def _build_message(query, prior_context, follow_up):
 
 # ── Planner agent ──────────────────────────────────────────────────────────────
 
-def planner_agent(query):
+def planner_agent(query, model):
     """
     Analyzes the query and returns an ordered list of agent names.
     The list forms the execution plan for the pipeline.
@@ -111,7 +101,7 @@ def planner_agent(query):
     "Why do people think AI will take all jobs?"→ ["assumption_questioner", "first_principles", "report_writer"]
     """
 
-    result = call_llm(system_prompt, query)
+    result = call_llm(system_prompt, query, model)
 
     try:
         cleaned = result.strip()
@@ -126,7 +116,7 @@ def planner_agent(query):
 
 # ── Specialist agents ──────────────────────────────────────────────────────────
 
-def game_theory_agent(query, prior_context=None):
+def game_theory_agent(query, model, prior_context=None):
     system = """
     You are a game theory strategist.
     Identify players, strategies, incentives, payoffs, and equilibria.
@@ -135,10 +125,10 @@ def game_theory_agent(query, prior_context=None):
     return call_llm(system, _build_message(
         query, prior_context,
         "Analyze from a game theory perspective, building on the prior analysis."
-    ))
+    ), model)
 
 
-def first_principles_agent(query, prior_context=None):
+def first_principles_agent(query, model, prior_context=None):
     system = """
     You are a first principles thinker.
     Identify base facts, flag assumptions, rebuild reasoning from the ground up.
@@ -147,10 +137,10 @@ def first_principles_agent(query, prior_context=None):
     return call_llm(system, _build_message(
         query, prior_context,
         "Apply first principles thinking. Build on or challenge the prior analysis."
-    ))
+    ), model)
 
 
-def assumption_questioner_agent(query, prior_context=None):
+def assumption_questioner_agent(query, model, prior_context=None):
     system = """
     You are a critical thinker.
     Identify hidden assumptions, challenge each one, highlight blind spots.
@@ -159,10 +149,10 @@ def assumption_questioner_agent(query, prior_context=None):
     return call_llm(system, _build_message(
         query, prior_context,
         "Challenge the assumptions in this analysis. What is being taken for granted?"
-    ))
+    ), model)
 
 
-def report_writer_agent(query, prior_context=None):
+def report_writer_agent(query, model, prior_context=None):
     system = """
     You are a report writer. Synthesize prior analysis into a clear, conversational
     summary — bottom line first, then supporting reasoning. No jargon.
@@ -170,7 +160,7 @@ def report_writer_agent(query, prior_context=None):
     return call_llm(system, _build_message(
         query, prior_context,
         "Write a clean, conversational report summarizing all of this."
-    ))
+    ), model)
 
 
 # Math agent with self-correction loop ─────────────────────────────────────────
@@ -188,7 +178,7 @@ def _execute_code(code):
         return False, str(e)
 
 
-def math_agent(query, prior_context=None):
+def math_agent(query, model, prior_context=None):
     """
     Generates Python code for the calculation, executes it, and returns the result.
     If execution fails, asks the LLM to fix the code and retries (up to MAX_RETRIES).
@@ -201,7 +191,7 @@ def math_agent(query, prior_context=None):
     code = call_llm(system, _build_message(
         query, prior_context,
         "Write Python code to calculate whatever numbers are needed here."
-    ))
+    ), model)
 
     for attempt in range(MAX_RETRIES):
         success, result = _execute_code(code)
@@ -213,6 +203,7 @@ def math_agent(query, prior_context=None):
             code = call_llm(
                 "You are a Python debugger. Fix the code and return ONLY corrected code, no markdown.",
                 f"Problem: {query}\n\nBroken code:\n{code}\n\nError: {result}\n\nFix it.",
+                model,
             )
 
     return f"Math failed after {MAX_RETRIES} attempts. Last error: {result}"
@@ -231,7 +222,7 @@ AGENT_REGISTRY = {
 
 # ── Pipeline executor ──────────────────────────────────────────────────────────
 
-def run_pipeline(query, plan):
+def run_pipeline(query, plan, model):
     """
     Executes agents in the order defined by the plan.
 
@@ -254,7 +245,7 @@ def run_pipeline(query, plan):
             continue
 
         try:
-            result = fn(query, prior_context=context if i > 1 else None)
+            result = fn(query, model, prior_context=context if i > 1 else None)
 
             if result is None:
                 print(f"  {agent_name} returned no output, skipping.")
@@ -279,17 +270,23 @@ def run_pipeline(query, plan):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Ask me anything: ")
+    parser = argparse.ArgumentParser(description="Multi-Agent AI Pipeline")
+    parser.add_argument("query", nargs="?", default=None, help="Your question")
+    parser.add_argument("--model", choices=PROVIDERS.keys(), default="claude", help="Model to use (default: claude)")
+    args = parser.parse_args()
+
+    query = args.query or input("Ask me anything: ")
+    model = PROVIDERS[args.model]
 
     print(f"\nQuery : {query}")
-    print(f"Model : {MODEL}")
+    print(f"Model : {model}")
 
     # Step 1 — planner decides which agents to run and in what order
-    plan = planner_agent(query)
+    plan = planner_agent(query, model)
     print(f"Plan  : {' -> '.join(plan)}\n")
 
     # Step 2 — run the pipeline, agents chain their outputs
-    output = run_pipeline(query, plan)
+    output = run_pipeline(query, plan, model)
 
     # Step 3 — print the last agent's section as the final answer
     last = plan[-1]
