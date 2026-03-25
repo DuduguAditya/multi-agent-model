@@ -256,6 +256,11 @@ def run_pipeline(query, plan):
         try:
             result = fn(query, prior_context=context if i > 1 else None)
 
+            if result is None:
+                print(f"  {agent_name} returned no output, skipping.")
+                context += f"\n\n--- {agent_name} ---\n(no output returned)"
+                continue
+
             if result.startswith("[ERROR]"):
                 print(f"  Error: {result}")
                 context += f"\n\n--- {agent_name} ---\n(error: {result})"
