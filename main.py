@@ -17,9 +17,11 @@ import io
 import json
 import os
 import sys
+from typing import List, Literal
 
 import litellm
 from dotenv import load_dotenv
+from pydantic import BaseModel, ValidationError
 
 load_dotenv()
 
@@ -40,6 +42,12 @@ AVAILABLE_AGENTS = [
 ]
 
 MAX_RETRIES = 3
+
+# Pydantic model for type-safe planner output validation
+AgentName = Literal["game_theory", "first_principles", "assumption_questioner", "math", "report_writer"]
+
+class ExecutionPlan(BaseModel):
+    agents: List[AgentName]
 
 
 # ── Core LLM call ──────────────────────────────────────────────────────────────
@@ -107,10 +115,10 @@ def planner_agent(query, model):
         cleaned = result.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        plan = json.loads(cleaned)
-        plan = [a for a in plan if a in AVAILABLE_AGENTS]
-        return plan if plan else ["first_principles", "report_writer"]
-    except (json.JSONDecodeError, TypeError):
+        # Wrap the array in a dict so Pydantic can validate it
+        plan = ExecutionPlan(agents=json.loads(cleaned))
+        return plan.agents
+    except (json.JSONDecodeError, TypeError, ValidationError):
         return ["first_principles", "report_writer"]
 
 
