@@ -13,9 +13,9 @@ Usage:
 """
 
 import argparse
-import io
 import json
 import os
+import subprocess
 import sys
 from typing import List, Literal
 
@@ -174,15 +174,20 @@ def report_writer_agent(query, model, prior_context=None):
 # Math agent with self-correction loop ─────────────────────────────────────────
 
 def _execute_code(code):
-    """Runs Python code in an isolated namespace, capturing printed output."""
+    """Runs generated code in a sandboxed subprocess, isolated from the main process."""
     try:
-        old_stdout, sys.stdout = sys.stdout, io.StringIO()
-        exec(code, {})
-        output = sys.stdout.getvalue().strip()
-        sys.stdout = old_stdout
-        return True, output
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return True, proc.stdout.strip()
+        return False, proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "Code execution timed out after 10 seconds."
     except Exception as e:
-        sys.stdout = old_stdout
         return False, str(e)
 
 
