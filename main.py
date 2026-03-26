@@ -303,6 +303,14 @@ def main():
             print("Goodbye!")
             break
 
+        # /btw — quick side question, bypasses the pipeline and history
+        if query.strip().lower().startswith("/btw"):
+            side_question = query.strip()[4:].strip()
+            print("\n[btw]")
+            answer = call_llm("You are a helpful assistant. Answer concisely.", side_question, model)
+            print(f"{answer}\n")
+            continue
+
         # Prepend prior conversation so agents have memory of past exchanges
         if history:
             prior = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
