@@ -21,7 +21,7 @@ from typing import List, Literal
 
 import litellm
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 
 load_dotenv()
 
@@ -47,34 +47,44 @@ MAX_RETRIES = 3
 AgentName = Literal["game_theory", "first_principles", "assumption_questioner", "math", "report_writer"]
 
 class ExecutionPlan(BaseModel):
-    agents: List[AgentName]
+    agents: List[AgentName] = Field(description="list of agents names")
 
 
 # ── Core LLM call ──────────────────────────────────────────────────────────────
 
-def call_llm(system_prompt, user_message, model):
+def call_llm(system_prompt, user_message, model, chat_history=[], structured_class=None):
+    
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Adding conversation chat_history to messages var
+    for user_msg, ai_msg in chat_history:
+        messages.append({"role": "user", "content": user_msg})
+        messages.append({"role": "assistant", "content": ai_msg})
+
+    # Adding user query
+    messages.append({"role": "user",   "content": user_message})
+
     try:
         response = litellm.completion(
             model=model,
             max_tokens=2048,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_message},
-            ],
+            messages=messages,
+            response_format=structured_class
         )
         return response.choices[0].message.content
+        
     except Exception as e:
         return f"[ERROR] {e}"
 
 
 # ── Shared message builder ─────────────────────────────────────────────────────
 
-def _build_message(query, prior_context, follow_up):
+def _build_message(query, agent_ctx, follow_up):
     """Combines the original query with accumulated context when available."""
-    if prior_context:
+    if agent_ctx:
         return (
+            f"Prior analysis:\n{agent_ctx}\n\n"
             f"Original question: {query}\n\n"
-            f"Prior analysis:\n{prior_context}\n\n"
             f"{follow_up}"
         )
     return query
@@ -82,7 +92,7 @@ def _build_message(query, prior_context, follow_up):
 
 # ── Planner agent ──────────────────────────────────────────────────────────────
 
-def planner_agent(query, model):
+def planner_agent(query, model, chat_history):
     """
     Analyzes the query and returns an ordered list of agent names.
     The list forms the execution plan for the pipeline.
@@ -109,66 +119,62 @@ def planner_agent(query, model):
     "Why do people think AI will take all jobs?"→ ["assumption_questioner", "first_principles", "report_writer"]
     """
 
-    result = call_llm(system_prompt, query, model)
+    result = call_llm(system_prompt, query, model, chat_history, structured_class=ExecutionPlan)
 
     try:
-        cleaned = result.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        # Wrap the array in a dict so Pydantic can validate it
-        plan = ExecutionPlan(agents=json.loads(cleaned))
+        plan: ExecutionPlan = ExecutionPlan.model_validate_json(result)
         return plan.agents
-    except (json.JSONDecodeError, TypeError, ValidationError):
+    except ValidationError:
         return ["first_principles", "report_writer"]
 
 
 # ── Specialist agents ──────────────────────────────────────────────────────────
 
-def game_theory_agent(query, model, prior_context=None):
+def game_theory_agent(query, model, agent_ctx=None, chat_history=[]):
     system = """
     You are a game theory strategist.
     Identify players, strategies, incentives, payoffs, and equilibria.
     Be specific and concise — under 200 words.
     """
     return call_llm(system, _build_message(
-        query, prior_context,
+        query, agent_ctx,
         "Analyze from a game theory perspective, building on the prior analysis."
-    ), model)
+    ), model, chat_history)
 
 
-def first_principles_agent(query, model, prior_context=None):
+def first_principles_agent(query, model, agent_ctx=None, chat_history=[]):
     system = """
     You are a first principles thinker.
     Identify base facts, flag assumptions, rebuild reasoning from the ground up.
     Under 200 words.
     """
     return call_llm(system, _build_message(
-        query, prior_context,
+        query, agent_ctx,
         "Apply first principles thinking. Build on or challenge the prior analysis."
-    ), model)
+    ), model, chat_history)
 
 
-def assumption_questioner_agent(query, model, prior_context=None):
+def assumption_questioner_agent(query, model, agent_ctx=None, chat_history=[]):
     system = """
     You are a critical thinker.
     Identify hidden assumptions, challenge each one, highlight blind spots.
     Under 200 words.
     """
     return call_llm(system, _build_message(
-        query, prior_context,
+        query, agent_ctx,
         "Challenge the assumptions in this analysis. What is being taken for granted?"
-    ), model)
+    ), model, chat_history)
 
 
-def report_writer_agent(query, model, prior_context=None):
+def report_writer_agent(query, model, agent_ctx=None, chat_history=[]):
     system = """
     You are a report writer. Synthesize prior analysis into a clear, conversational
     summary — bottom line first, then supporting reasoning. No jargon.
     """
     return call_llm(system, _build_message(
-        query, prior_context,
+        query, agent_ctx,
         "Write a clean, conversational report summarizing all of this."
-    ), model)
+    ), model, chat_history)
 
 
 # Math agent with self-correction loop ─────────────────────────────────────────
@@ -191,7 +197,7 @@ def _execute_code(code):
         return False, str(e)
 
 
-def math_agent(query, model, prior_context=None):
+def math_agent(query, model, agent_ctx=None, chat_history=[]):
     """
     Generates Python code for the calculation, executes it, and returns the result.
     If execution fails, asks the LLM to fix the code and retries (up to MAX_RETRIES).
@@ -202,7 +208,7 @@ def math_agent(query, model, prior_context=None):
     Return ONLY raw Python code — no markdown, no explanations.
     """
     code = call_llm(system, _build_message(
-        query, prior_context,
+        query, agent_ctx,
         "Write Python code to calculate whatever numbers are needed here."
     ), model)
 
@@ -216,7 +222,7 @@ def math_agent(query, model, prior_context=None):
             code = call_llm(
                 "You are a Python debugger. Fix the code and return ONLY corrected code, no markdown.",
                 f"Problem: {query}\n\nBroken code:\n{code}\n\nError: {result}\n\nFix it.",
-                model,
+                model, chat_history
             )
 
     return f"Math failed after {MAX_RETRIES} attempts. Last error: {result}"
@@ -235,9 +241,9 @@ AGENT_REGISTRY = {
 
 # ── Pipeline executor ──────────────────────────────────────────────────────────
 
-def run_pipeline(query, plan, model):
+def run_pipeline(query, agent_name_list, model, chat_history):
     """
-    Executes agents in the order defined by the plan.
+    Executes agents in the order defined by the agent_name_list.
 
     Each agent receives:
       - The original query (so context of the question is never lost)
@@ -245,12 +251,11 @@ def run_pipeline(query, plan, model):
 
     Errors in individual agents are logged but do not stop the pipeline.
     """
-    context = ""
-    completed = []
 
-    for i, agent_name in enumerate(plan, 1):
-        inputs = "query" if i == 1 else f"query + {' + '.join(completed)}"
-        print(f"[{i}/{len(plan)}] {agent_name}  ({inputs})")
+    agent_results = []
+
+    for i, agent_name in enumerate(agent_name_list, 1):
+        print(f"[{i}/{len(agent_name_list)}] ---> {agent_name}")
 
         fn = AGENT_REGISTRY.get(agent_name)
         if not fn:
@@ -258,83 +263,74 @@ def run_pipeline(query, plan, model):
             continue
 
         try:
-            result = fn(query, model, prior_context=context if i > 1 else None)
+            agent_ctx = ''.join([f'--- start of {a_name} analysis ---\n{a_result}\n --- end of {a_name} analysis ---\n'   for a_name, a_result in agent_results])
+            print(f'===================>agent_ctx:\n {agent_ctx} \n<<=========')
+            result = fn(query, model, agent_ctx, chat_history)
 
             if result is None:
                 print(f"  {agent_name} returned no output, skipping.")
-                context += f"\n\n--- {agent_name} ---\n(no output returned)"
+                agent_results.append((agent_name, f'No output result from agent: {agent_name}.'))
                 continue
 
             if result.startswith("[ERROR]"):
                 print(f"  Error: {result}")
-                context += f"\n\n--- {agent_name} ---\n(error: {result})"
+                agent_results.append((agent_name, f"Error: {result}"))
             else:
                 print(f"  -> {result[:80].replace(chr(10), ' ')}...")
-                context += f"\n\n--- {agent_name} ---\n{result}"
-                completed.append(agent_name)
+                agent_results.append((agent_name, result))
 
         except Exception as e:
             print(f"  {agent_name} crashed: {e}")
-            context += f"\n\n--- {agent_name} ---\n(crashed: {e})"
+            agent_results.append((agent_name, f"Crashed, with error message: {e}"))
 
-    return context
+    return agent_results
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Agent AI Pipeline")
-    parser.add_argument("query", nargs="?", default=None, help="Your question")
     parser.add_argument("--model", choices=PROVIDERS.keys(), default="claude", help="Model to use (default: claude)")
     args = parser.parse_args()
 
     model = PROVIDERS[args.model]
     print(f"Model : {model}  |  type 'quit' to exit\n")
 
-    # Conversation history — stores (question, answer) pairs across turns
-    history = []
+    # Conversation chat_history — stores (question, answer) pairs across turns
+    chat_history = []
 
     # Keep the session alive for follow-up questions
     while True:
-        query = args.query or input("Ask me anything: ")
-        args.query = None  # clear after first use so loop prompts on next turn
+        query = input("Ask me anything...\n")
 
         if query.strip().lower() in ("quit", "exit"):
             print("Goodbye!")
-            break
+            return
 
-        # /btw — quick side question, bypasses the pipeline and history
-        if query.strip().lower().startswith("/btw"):
+        # /btw — quick side question, bypasses the pipeline and chat_history
+        elif query.strip().lower().startswith("/btw"):
             side_question = query.strip()[4:].strip()
             print("\n[btw]")
-            answer = call_llm("You are a helpful assistant. Answer concisely.", side_question, model)
+            answer = call_llm(f"You are a helpful assistant. Answer concisely.", side_question, model, chat_history) 
             print(f"{answer}\n")
-            continue
 
-        # Prepend prior conversation so agents have memory of past exchanges
-        if history:
-            prior = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
-            full_query = f"Previous conversation:\n{prior}\n\nNew question: {query}"
         else:
-            full_query = query
+            print(f"\nQuery : {query}")
 
-        print(f"\nQuery : {query}")
+            # Step 1 — planner decides which agents to run and in what order
+            plan = planner_agent(query, model, chat_history)
+            print(f"Plan  : {' -> '.join(plan)}\n")
 
-        # Step 1 — planner decides which agents to run and in what order
-        plan = planner_agent(full_query, model)
-        print(f"Plan  : {' -> '.join(plan)}\n")
+            # Step 2 — run the pipeline, agents chain their outputs
+            agent_results = run_pipeline(query, plan, model, chat_history)
 
-        # Step 2 — run the pipeline, agents chain their outputs
-        output = run_pipeline(full_query, plan, model)
+            # Step 3 — extract and print the last agent's section as the final answer
+            answer = agent_results[-1][1] if len(agent_results)>0 else 'No result.'
 
-        # Step 3 — extract and print the last agent's section as the final answer
-        last = plan[-1]
-        parts = output.split(f"--- {last} ---")
-        answer = parts[-1].strip() if len(parts) > 1 else output.strip()
-        print(f"\nANSWER:\n{answer}\n")
+            print(f"\nANSWER:\n{answer}\n")
 
-        # Store this exchange for future turns
-        history.append((query, answer))
+            # Store this exchange for future turns
+            chat_history.append((query, answer))
 
 
 if __name__ == "__main__":
