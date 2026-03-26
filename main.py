@@ -288,23 +288,45 @@ def main():
     parser.add_argument("--model", choices=PROVIDERS.keys(), default="claude", help="Model to use (default: claude)")
     args = parser.parse_args()
 
-    query = args.query or input("Ask me anything: ")
     model = PROVIDERS[args.model]
+    print(f"Model : {model}  |  type 'quit' to exit\n")
 
-    print(f"\nQuery : {query}")
-    print(f"Model : {model}")
+    # Conversation history — stores (question, answer) pairs across turns
+    history = []
 
-    # Step 1 — planner decides which agents to run and in what order
-    plan = planner_agent(query, model)
-    print(f"Plan  : {' -> '.join(plan)}\n")
+    # Keep the session alive for follow-up questions
+    while True:
+        query = args.query or input("Ask me anything: ")
+        args.query = None  # clear after first use so loop prompts on next turn
 
-    # Step 2 — run the pipeline, agents chain their outputs
-    output = run_pipeline(query, plan, model)
+        if query.strip().lower() in ("quit", "exit"):
+            print("Goodbye!")
+            break
 
-    # Step 3 — print the last agent's section as the final answer
-    last = plan[-1]
-    parts = output.split(f"--- {last} ---")
-    print(f"\nANSWER:\n{parts[-1].strip() if len(parts) > 1 else output.strip()}")
+        # Prepend prior conversation so agents have memory of past exchanges
+        if history:
+            prior = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
+            full_query = f"Previous conversation:\n{prior}\n\nNew question: {query}"
+        else:
+            full_query = query
+
+        print(f"\nQuery : {query}")
+
+        # Step 1 — planner decides which agents to run and in what order
+        plan = planner_agent(full_query, model)
+        print(f"Plan  : {' -> '.join(plan)}\n")
+
+        # Step 2 — run the pipeline, agents chain their outputs
+        output = run_pipeline(full_query, plan, model)
+
+        # Step 3 — extract and print the last agent's section as the final answer
+        last = plan[-1]
+        parts = output.split(f"--- {last} ---")
+        answer = parts[-1].strip() if len(parts) > 1 else output.strip()
+        print(f"\nANSWER:\n{answer}\n")
+
+        # Store this exchange for future turns
+        history.append((query, answer))
 
 
 if __name__ == "__main__":
